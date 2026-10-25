@@ -2,16 +2,17 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from urllib.parse import quote, urlparse
 import yt_dlp
+import hashlib
 import ipaddress
 import re
 import os
 import shutil
 import socket
 import tempfile
+import threading
 import time
 import uuid
 
@@ -50,23 +51,55 @@ def is_safe_url(url: str) -> bool:
 # Cookies file path (put cookies.txt in same folder as main.py)
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
-# Each proxy download gets its own folder under this one
+# ffmpeg is needed to merge video-only + audio streams. Render's Python
+# runtime has no system ffmpeg, so use the binary bundled with imageio-ffmpeg.
+try:
+    import imageio_ffmpeg
+    FFMPEG_LOCATION = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    FFMPEG_LOCATION = shutil.which("ffmpeg")
+print(f"Using ffmpeg: {FFMPEG_LOCATION}")
+
+# Finished proxy downloads are cached here (one folder per video+format),
+# and kept until unused for STALE_DOWNLOAD_SECONDS so paused downloads can resume
 DOWNLOAD_ROOT = os.path.join(tempfile.gettempdir(), "videosaver_downloads")
 STALE_DOWNLOAD_SECONDS = 60 * 60
+BUILDING_PREFIX = "building-"
+LAST_ACCESS_MARKER = ".last_access"
 MAX_FILESIZE_BYTES = 1024 * 1024 * 1024  # 1 GB - protects Render's small disk
 FORMAT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-+.]{1,100}$")
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 
 
+_build_locks: dict[str, threading.Lock] = {}
+_build_locks_guard = threading.Lock()
+
+
+def _get_build_lock(cache_key: str) -> threading.Lock:
+    """One lock per video+format so two requests never build the same file at once."""
+    with _build_locks_guard:
+        return _build_locks.setdefault(cache_key, threading.Lock())
+
+
+def _mark_accessed(cache_dir: str):
+    # A separate marker file: touching video.mp4 itself would change its
+    # mtime and therefore its ETag, which would break If-Range resumes
+    marker = os.path.join(cache_dir, LAST_ACCESS_MARKER)
+    with open(marker, "w"):
+        pass
+
+
 def cleanup_stale_downloads():
-    """Remove leftovers from downloads that failed or whose client disconnected."""
+    """Remove cached videos unused for an hour, and failed/abandoned builds."""
     if not os.path.isdir(DOWNLOAD_ROOT):
         return
     now = time.time()
     for name in os.listdir(DOWNLOAD_ROOT):
         path = os.path.join(DOWNLOAD_ROOT, name)
+        marker = os.path.join(path, LAST_ACCESS_MARKER)
         try:
-            if now - os.path.getmtime(path) > STALE_DOWNLOAD_SECONDS:
+            last_used = os.path.getmtime(marker if os.path.exists(marker) else path)
+            if now - last_used > STALE_DOWNLOAD_SECONDS:
                 shutil.rmtree(path, ignore_errors=True)
         except Exception:
             pass
@@ -143,9 +176,28 @@ def download_proxy(video_url: str, format_id: str = "best"):
         raise HTTPException(status_code=400, detail="Invalid format.")
 
     cleanup_stale_downloads()
-    # Own folder per request so yt-dlp's partial/intermediate files
-    # (.part, .f137.mp4 before merging) are always removed together
-    work_dir = os.path.join(DOWNLOAD_ROOT, uuid.uuid4().hex)
+
+    # The finished file is cached per (video, format) so a paused download
+    # can resume: the next request gets the exact same bytes (and ETag)
+    # instead of a freshly rebuilt file that would differ.
+    cache_key = hashlib.sha256(f"{video_url}|{format_id}".encode()).hexdigest()[:32]
+    cache_dir = os.path.join(DOWNLOAD_ROOT, cache_key)
+    cached_file = os.path.join(cache_dir, "video.mp4")
+
+    with _get_build_lock(cache_key):
+        if not os.path.exists(cached_file):
+            _build_video(video_url, format_id, cache_dir, cached_file)
+        _mark_accessed(cache_dir)
+
+    # FileResponse serves Range requests (206) and honours If-Range with the
+    # ETag, so a client resuming against a rebuilt file gets the full file
+    return FileResponse(cached_file, media_type="video/mp4", filename="video.mp4")
+
+
+def _build_video(video_url: str, format_id: str, cache_dir: str, cached_file: str):
+    # Build in a private folder so yt-dlp's partial/intermediate files
+    # (.part, .f137.mp4 before merging) never appear in the cache
+    work_dir = os.path.join(DOWNLOAD_ROOT, f"{BUILDING_PREFIX}{uuid.uuid4().hex}")
     os.makedirs(work_dir, exist_ok=True)
     out_file = os.path.join(work_dir, "video.mp4")
 
@@ -163,6 +215,8 @@ def download_proxy(video_url: str, format_id: str = "best"):
         "quiet": True,
         "no_warnings": True,
     }
+    if FFMPEG_LOCATION:
+        ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
     if os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
 
@@ -181,12 +235,9 @@ def download_proxy(video_url: str, format_id: str = "best"):
             detail="Downloaded video file could not be created. It may be larger than 1 GB.",
         )
 
-    return FileResponse(
-        out_file,
-        media_type="video/mp4",
-        filename="video.mp4",
-        background=BackgroundTask(cleanup),
-    )
+    os.makedirs(cache_dir, exist_ok=True)
+    os.replace(out_file, cached_file)
+    cleanup()
 
 
 # -----------------------------------------
