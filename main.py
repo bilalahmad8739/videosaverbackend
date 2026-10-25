@@ -78,6 +78,8 @@ def download_proxy(video_url: str, format_id: str = "best"):
     ydl_opts = {
         "format": fmt,
         "outtmpl": out_file,
+        # Video-only + audio-only streams get merged; keep the result as .mp4
+        "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
     }
@@ -165,6 +167,11 @@ def extract_video(request: ExtractRequest):
         ext = f.get("ext", "mp4")
         filesize_bytes = f.get("filesize") or f.get("filesize_approx") or 0
         format_id = f.get("format_id", "")
+
+        # Higher qualities are often video-only (DASH) with audio in a separate
+        # stream. Ask yt-dlp to merge the best audio in, or the file is silent.
+        if format_id and f.get("acodec") == "none":
+            format_id = f"{format_id}+bestaudio"
 
         if filesize_bytes and filesize_bytes > 0:
             if filesize_bytes >= 1_000_000:
