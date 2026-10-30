@@ -3,10 +3,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
+import urllib.request
 import yt_dlp
 import hashlib
 import ipaddress
+import json
 import re
 import os
 import shutil
@@ -129,6 +131,139 @@ def friendly_error(err: Exception) -> str:
     msg = msg.split(" Use --")[0].split("; please report")[0]
     return msg.strip() or "Could not process this video."
 
+
+def format_size(size_bytes) -> str:
+    if not size_bytes or size_bytes <= 0:
+        return "Unknown size"
+    if size_bytes >= 1_000_000:
+        return f"{size_bytes / 1_000_000:.1f} MB"
+    if size_bytes >= 1_000:
+        return f"{size_bytes / 1_000:.1f} KB"
+    return f"{size_bytes} B"
+
+
+def format_duration(duration_sec) -> str:
+    duration_sec = duration_sec or 0
+    return f"{int(duration_sec // 60)}:{int(duration_sec % 60):02d}"
+
+
+# -----------------------------------------
+# TikTok: blocks datacenter servers (like Render) with a bot-check page,
+# which yt-dlp reports as "Unexpected response from webpage request".
+# Countered with a Chrome-like TLS fingerprint, retries, and a tikwm.com
+# fallback.
+# -----------------------------------------
+TIKTOK_ATTEMPTS = 3
+TIKWM_API = "https://www.tikwm.com/api/"
+
+
+def is_tiktok(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "tiktok.com" or host.endswith(".tiktok.com")
+
+
+def _detect_impersonate_target():
+    # Needs curl_cffi; without it yt-dlp would fail every TikTok request
+    try:
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        target = ImpersonateTarget("chrome")
+        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+            if ydl._impersonate_target_available(target):
+                return target
+    except Exception as e:
+        print(f"Impersonation check failed: {e}")
+    return None
+
+
+IMPERSONATE_TARGET = _detect_impersonate_target()
+print(f"Browser impersonation: {'on' if IMPERSONATE_TARGET else 'off (curl_cffi not usable)'}")
+
+
+def site_opts(url: str) -> dict:
+    """Extra yt-dlp options for sites that block plain server requests."""
+    if is_tiktok(url) and IMPERSONATE_TARGET:
+        return {"impersonate": IMPERSONATE_TARGET}
+    return {}
+
+
+def run_ydl(ydl_opts: dict, url: str, download: bool):
+    """Run yt-dlp, retrying TikTok a few times: its bot check often lets a
+    later attempt through."""
+    attempts = TIKTOK_ATTEMPTS if is_tiktok(url) else 1
+    for attempt in range(attempts):
+        try:
+            with yt_dlp.YoutubeDL({**ydl_opts, **site_opts(url)}) as ydl:
+                if download:
+                    ydl.download([url])
+                    return None
+                return ydl.extract_info(url, download=False)
+        except yt_dlp.utils.DownloadError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(1 + attempt)
+
+
+def extract_tiktok_fallback(url: str):
+    """Get a TikTok video from tikwm.com when TikTok blocks this server.
+    Returns direct CDN links that the app downloads itself (no proxy), or
+    None if tikwm can't help either."""
+    try:
+        req = urllib.request.Request(
+            TIKWM_API,
+            data=urlencode({"url": url, "hd": 1}).encode(),
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.load(resp)
+    except Exception as e:
+        print(f"tikwm fallback failed for {url}: {e}")
+        return None
+
+    data = payload.get("data") if payload.get("code") == 0 else None
+    if not isinstance(data, dict):
+        print(f"tikwm fallback gave no data for {url}: {payload.get('msg')}")
+        return None
+    if data.get("images"):
+        raise HTTPException(
+            status_code=400,
+            detail="This TikTok is a photo post, not a video.",
+        )
+
+    def absolute(link):
+        if isinstance(link, str) and link.startswith("/"):
+            return f"https://www.tikwm.com{link}"
+        return link if isinstance(link, str) and link.startswith("http") else None
+
+    hd_url, hd_size = absolute(data.get("hdplay")), data.get("hd_size")
+    sd_url, sd_size = absolute(data.get("play")), data.get("size")
+    # "play" is often the very same file as "hdplay"; offer it only if it differs
+    if hd_url and sd_url and (sd_url == hd_url or (sd_size and sd_size == hd_size)):
+        sd_url = None
+
+    candidates = [
+        ("hd", hd_url, hd_size),
+        ("sd" if hd_url else "hd", sd_url, sd_size),
+        ("watermarked", absolute(data.get("wmplay")), data.get("wm_size")),
+    ]
+    formats = [
+        VideoFormat(quality=q, url=link, ext="mp4", filesize=format_size(size))
+        for q, link, size in candidates
+        if link
+    ]
+    if not formats:
+        return None
+
+    author = data.get("author") if isinstance(data.get("author"), dict) else {}
+    return VideoResponse(
+        title=data.get("title") or "TikTok Video",
+        thumbnail=absolute(data.get("cover")) or "",
+        duration=format_duration(data.get("duration")),
+        uploader=author.get("nickname") or author.get("unique_id") or "Unknown",
+        platform="TikTok",
+        video_url=url,
+        formats=formats,
+    )
+
 # -----------------------------------------
 # Request / Response models
 # -----------------------------------------
@@ -221,8 +356,7 @@ def _build_video(video_url: str, format_id: str, cache_dir: str, cached_file: st
         ydl_opts["cookiefile"] = COOKIES_FILE
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
+        run_ydl(ydl_opts, video_url, download=True)
     except Exception as e:
         cleanup()
         raise HTTPException(status_code=500, detail=f"Download failed: {friendly_error(e)}")
@@ -271,9 +405,12 @@ def extract_video(request: ExtractRequest):
         print("No cookies.txt found - running without cookies")
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = run_ydl(ydl_opts, url, download=False)
     except yt_dlp.utils.DownloadError as e:
+        if is_tiktok(url):
+            fallback = extract_tiktok_fallback(url)
+            if fallback:
+                return fallback
         raise HTTPException(status_code=400, detail=friendly_error(e))
     except Exception as e:
         print(f"Extract failed for {url}: {e}")
@@ -322,15 +459,7 @@ def extract_video(request: ExtractRequest):
             if filesize_bytes:
                 filesize_bytes += best_audio_size
 
-        if filesize_bytes and filesize_bytes > 0:
-            if filesize_bytes >= 1_000_000:
-                filesize = f"{filesize_bytes / 1_000_000:.1f} MB"
-            elif filesize_bytes >= 1_000:
-                filesize = f"{filesize_bytes / 1_000:.1f} KB"
-            else:
-                filesize = f"{filesize_bytes} B"
-        else:
-            filesize = "Unknown size"
+        filesize = format_size(filesize_bytes)
 
         key = f"{quality}-{ext}"
         if key in seen_qualities:
@@ -350,6 +479,9 @@ def extract_video(request: ExtractRequest):
         heights[download_url] = f.get("height") or 0
 
     if not formats:
+        fallback = extract_tiktok_fallback(url) if is_tiktok(url) else None
+        if fallback:
+            return fallback
         raise HTTPException(status_code=404, detail="No downloadable video formats found.")
 
     def quality_sort_key(f: VideoFormat):
@@ -361,10 +493,7 @@ def extract_video(request: ExtractRequest):
 
     formats.sort(key=quality_sort_key, reverse=True)
 
-    duration_sec = info.get("duration", 0) or 0
-    minutes = int(duration_sec // 60)
-    seconds = int(duration_sec % 60)
-    duration_str = f"{minutes}:{seconds:02d}"
+    duration_str = format_duration(info.get("duration"))
 
     # `or` (not a .get default): sites often return these keys set to None,
     # which would fail response validation with a 500
