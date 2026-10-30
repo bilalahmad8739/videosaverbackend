@@ -279,7 +279,16 @@ def extract_video(request: ExtractRequest):
         print(f"Extract failed for {url}: {e}")
         raise HTTPException(status_code=500, detail="Server error. Please try again.")
 
-    raw_formats = info.get("formats") or []
+    # Profile/story links come back as a playlist with no video of their own
+    if info.get("_type") == "playlist" or (info.get("entries") and not info.get("formats")):
+        raise HTTPException(
+            status_code=400,
+            detail="This link is a profile or playlist. Please share a single video link.",
+        )
+
+    # Some extractors (e.g. Snapchat Spotlight) return one direct video URL
+    # on the result itself instead of a formats list
+    raw_formats = info.get("formats") or ([info] if info.get("url") else [])
     formats = []
     heights = {}  # format url -> pixel height, used for sorting
     seen_qualities = set()
