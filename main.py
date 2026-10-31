@@ -30,7 +30,11 @@ app.add_middleware(
 # -----------------------------------------
 # Blocked platforms
 # -----------------------------------------
-BLOCKED_DOMAINS = ["youtube.com", "youtu.be"]
+BLOCKED_DOMAINS = ["youtube.com", "youtu.be", "youtube-nocookie.com", "googlevideo.com"]
+
+# Turns off yt-dlp's YouTube support, so links that only reach YouTube
+# after a redirect (bit.ly etc.) or an embed still can't be downloaded
+NO_YOUTUBE_EXTRACTORS = ["default", "-youtube"]
 
 def is_blocked(url: str) -> bool:
     return any(domain in url.lower() for domain in BLOCKED_DOMAINS)
@@ -192,7 +196,8 @@ def run_ydl(ydl_opts: dict, url: str, download: bool):
     attempts = TIKTOK_ATTEMPTS if is_tiktok(url) else 1
     for attempt in range(attempts):
         try:
-            with yt_dlp.YoutubeDL({**ydl_opts, **site_opts(url)}) as ydl:
+            opts = {**ydl_opts, **site_opts(url), "allowed_extractors": NO_YOUTUBE_EXTRACTORS}
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 if download:
                     ydl.download([url])
                     return None
@@ -415,6 +420,9 @@ def extract_video(request: ExtractRequest):
     except Exception as e:
         print(f"Extract failed for {url}: {e}")
         raise HTTPException(status_code=500, detail="Server error. Please try again.")
+
+    if is_blocked(info.get("webpage_url") or "") or "youtube" in (info.get("extractor_key") or "").lower():
+        raise HTTPException(status_code=403, detail="YouTube is not supported.")
 
     # Profile/story links come back as a playlist with no video of their own
     if info.get("_type") == "playlist" or (info.get("entries") and not info.get("formats")):
