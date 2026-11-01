@@ -28,16 +28,107 @@ app.add_middleware(
 )
 
 # -----------------------------------------
-# Blocked platforms
+# Supported sites (allowlist)
 # -----------------------------------------
+# ClipGet only works with the sites listed in the app. Every other site is
+# refused, so the service can't be used to fetch adult or other unwanted content.
+SUPPORTED_SITES_TEXT = (
+    "TikTok, Instagram, Facebook, Pinterest, Dailymotion, Snapchat, Vimeo, "
+    "LinkedIn and Twitch"
+)
+UNSUPPORTED_MESSAGE = f"This site isn't supported. ClipGet works with links from {SUPPORTED_SITES_TEXT}."
+YOUTUBE_MESSAGE = f"YouTube is not supported. Please use links from {SUPPORTED_SITES_TEXT}."
+
+# Website addresses allowed (subdomains included)
+SUPPORTED_DOMAINS = [
+    "tiktok.com", "instagram.com", "instagr.am", "facebook.com", "fb.watch",
+    "pin.it", "dailymotion.com", "dai.ly",
+    "snapchat.com", "vimeo.com", "linkedin.com", "twitch.tv",
+]
+# Pinterest has many country addresses (pinterest.com, pinterest.co.uk, pinterest.fr ...)
+PINTEREST_HOST = re.compile(r"^(?:[a-z0-9-]+\.)*pinterest\.[a-z]{2,3}(?:\.[a-z]{2})?$")
+
+# Short links that only redirect to the real page on the same site
+SHORT_LINK_DOMAINS = [
+    "vt.tiktok.com", "vm.tiktok.com", "pin.it", "dai.ly", "fb.watch",
+    "instagr.am", "t.snapchat.com",
+]
+# Links like /t/abc or /share/abc also redirect to the real page
+SHARE_PATH = re.compile(r"^/(?:t|share)/")
+
+# yt-dlp is limited to the extractors for those sites. Its "generic"
+# extractor, which can read almost any website, is off.
+SUPPORTED_EXTRACTORS = [
+    r"tiktok.*", r"instagram.*", r"facebook.*", r"pinterest.*",
+    r"dailymotion.*", r"snapchat.*", r"vimeo.*", r"linkedin.*", r"twitch.*",
+]
+
+# YouTube is never allowed, even when it is reached through a redirect or embed
 BLOCKED_DOMAINS = ["youtube.com", "youtu.be", "youtube-nocookie.com", "googlevideo.com"]
 
-# Turns off yt-dlp's YouTube support, so links that only reach YouTube
-# after a redirect (bit.ly etc.) or an embed still can't be downloaded
-NO_YOUTUBE_EXTRACTORS = ["default", "-youtube"]
+RESOLVE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 def is_blocked(url: str) -> bool:
     return any(domain in url.lower() for domain in BLOCKED_DOMAINS)
+
+def host_of(url: str) -> str:
+    return (urlparse(url).hostname or "").lower().rstrip(".")
+
+def _host_in(host: str, domains) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+def is_supported_site(url: str) -> bool:
+    host = host_of(url)
+    return _host_in(host, SUPPORTED_DOMAINS) or bool(PINTEREST_HOST.match(host))
+
+def is_short_link(url: str) -> bool:
+    """True for links that only redirect to the real video page."""
+    return _host_in(host_of(url), SHORT_LINK_DOMAINS) or bool(
+        SHARE_PATH.match(urlparse(url).path or "")
+    )
+
+def extractors_for(url: str) -> list:
+    """Which yt-dlp extractors may read this link. Only a short link that could
+    not be followed first may also use the generic extractor, because that is
+    the only way yt-dlp can follow it; these links belong to the sites above."""
+    if is_short_link(url):
+        return SUPPORTED_EXTRACTORS + ["generic"]
+    return SUPPORTED_EXTRACTORS
+
+def resolve_short_link(url: str) -> str:
+    """Follow a short link (pin.it, vt.tiktok.com ...) to the real page so the
+    real address can be checked. Returns the original link if it can't be followed."""
+    if not is_short_link(url):
+        return url
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": RESOLVE_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.geturl()
+    except Exception as e:
+        print(f"Could not follow short link {url}: {e}")
+        return url
+
+def prepare_link(url: str) -> str:
+    """Checks a link from the app and follows short links. Returns the address
+    to use, or refuses it with a clear message."""
+    if is_blocked(url):
+        raise HTTPException(status_code=403, detail=YOUTUBE_MESSAGE)
+    if not is_safe_url(url):
+        raise HTTPException(status_code=400, detail="Please enter a valid video link (http or https).")
+    if not is_supported_site(url):
+        raise HTTPException(status_code=403, detail=UNSUPPORTED_MESSAGE)
+
+    final = resolve_short_link(url)
+    if final != url:
+        # The real page must pass the same checks
+        if is_blocked(final):
+            raise HTTPException(status_code=403, detail=YOUTUBE_MESSAGE)
+        if not is_supported_site(final) or not is_safe_url(final):
+            raise HTTPException(status_code=403, detail=UNSUPPORTED_MESSAGE)
+    return final
 
 def is_safe_url(url: str) -> bool:
     """Only public http(s) links: stops the server being used to reach
@@ -196,7 +287,7 @@ def run_ydl(ydl_opts: dict, url: str, download: bool):
     attempts = TIKTOK_ATTEMPTS if is_tiktok(url) else 1
     for attempt in range(attempts):
         try:
-            opts = {**ydl_opts, **site_opts(url), "allowed_extractors": NO_YOUTUBE_EXTRACTORS}
+            opts = {**ydl_opts, **site_opts(url), "allowed_extractors": extractors_for(url)}
             with yt_dlp.YoutubeDL(opts) as ydl:
                 if download:
                     ydl.download([url])
@@ -308,10 +399,7 @@ def ping():
 # -----------------------------------------
 @app.get("/download-proxy")
 def download_proxy(video_url: str, format_id: str = "best"):
-    if is_blocked(video_url):
-        raise HTTPException(status_code=403, detail="YouTube is not supported.")
-    if not is_safe_url(video_url):
-        raise HTTPException(status_code=400, detail="Invalid video link.")
+    video_url = prepare_link(video_url)
     if format_id and format_id != "best" and not FORMAT_ID_PATTERN.match(format_id):
         raise HTTPException(status_code=400, detail="Invalid format.")
 
@@ -384,16 +472,8 @@ def _build_video(video_url: str, format_id: str, cache_dir: str, cached_file: st
 # -----------------------------------------
 @app.post("/extract", response_model=VideoResponse)
 def extract_video(request: ExtractRequest):
-    url = request.url.strip()
-
-    # Block YouTube
-    if is_blocked(url):
-        raise HTTPException(
-            status_code=403,
-            detail="YouTube is not supported. Please use Instagram, TikTok, Facebook, Twitter, or other platforms."
-        )
-    if not is_safe_url(url):
-        raise HTTPException(status_code=400, detail="Please enter a valid video link (http or https).")
+    # Only the supported sites are accepted; short links are followed first
+    url = prepare_link(request.url.strip())
 
     ydl_opts = {
         "quiet": True,
